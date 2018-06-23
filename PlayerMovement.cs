@@ -24,21 +24,18 @@ public class PlayerMovement : MonoBehaviour {
 
 	public bool isGrounded;
 	public float groundAngleMax = 40f;
-	private float groundNormal;
+	public float groundNormal;
 	public float frictionSpeedSqr = 0.4f;
 
 	public bool isWall;
 	public float wallAngleMax = 120f;
-	private float wallNormal;
+	public float wallNormal;
 
 	public PlayerStandardMovement pmove;
-
 	public PlayerJump pjump;
-
-	public PlayerStandardDash pdash;
-
-	public PlayerWall pwall;
-
+	public PlayerDash pdash;
+	public PlayerWallClimb pwall;
+	public PlayerWallJump pwalljump;
 	public PlayerBash pbash;
 
 	private bool lookingRight;
@@ -46,7 +43,6 @@ public class PlayerMovement : MonoBehaviour {
 	private float initGravityScale, initFixedDeltaTimescale;
 
 	public BoxCollider2D groundCollider, wallCollider;
-	public CapsuleCollider2D bashCollider;
 
 	public ParticleSystem.Burst jumpBurst;
 
@@ -70,6 +66,7 @@ public class PlayerMovement : MonoBehaviour {
 		pdash.Init(this);
 		pwall.Init(this);
 		pbash.Init(this);
+		pwalljump.Init(this);
 	}
 
 	void Update() {
@@ -99,18 +96,11 @@ public class PlayerMovement : MonoBehaviour {
 		vel = body.velocity;
 		overrideVel = Vector2.positiveInfinity;
 
-		body.gravityScale = applyGravity ? initGravityScale : 0;
+		applyGravity = true;
+		trail.enabled = true;
 
 		UpdateContacts();
 		pbash.UpdateBashCommon();
-
-		var freeze = isGrounded && vel.sqrMagnitude < frictionSpeedSqr;
-		if (freeze) {
-			vel = Vector2.zero;
-			//body.constraints = RigidbodyConstraints2D.FreezeAll;
-		} else {
-			body.constraints = RigidbodyConstraints2D.FreezeRotation;
-		}
 
 		if (!isGrounded) {
 			groundNormal = 0;
@@ -122,14 +112,16 @@ public class PlayerMovement : MonoBehaviour {
 		switch (mode) {
 			case MoveMode.STANDARD:
 
-				applyGravity = true;
-				trail.enabled = true;
+				var pmoveVel = pmove.Update();
+				OverrideNonZero(ref vel, pmoveVel);
 
-				OverrideNonZero(ref vel, pmove.Update());
+				if (isGrounded && horz == 0) {
+					vel.x = pmoveVel.x;
+				}
 
 				vel.x += pjump.Update().x;
-
 				pdash.Update();
+
 
 				if (!isGrounded && isWall) {
 					mode = MoveMode.WALL;
@@ -138,8 +130,12 @@ public class PlayerMovement : MonoBehaviour {
 				break;
 			case MoveMode.WALL:
 
-				OverrideNonZero(ref vel, pwall.Update());
+				trail.enabled = false;
+
 				OverrideNonZero(ref vel, pmove.Update());
+				OverrideNonZero(ref vel, pwall.Update());
+				OverrideNonZero(ref vel, pwalljump.Update());
+				pdash.Update();
 
 				if (isGrounded || !isWall) {
 					mode = MoveMode.STANDARD;
@@ -151,7 +147,7 @@ public class PlayerMovement : MonoBehaviour {
 					mode = MoveMode.STANDARD;
 					break;
 				}
-				pbash.Update();
+				OverrideNonZero(ref vel, pbash.Update());
 
 				break;
 			case MoveMode.STOMP:
@@ -165,8 +161,11 @@ public class PlayerMovement : MonoBehaviour {
 				break;
 		}
 
+		body.gravityScale = applyGravity ? initGravityScale : 0;
+
 		OverrideNonInf(ref vel, overrideVel);
 		body.velocity = vel;
+		//pmove.SetX(vel.x);
 	}
 
 	#region Contacts
@@ -182,9 +181,6 @@ public class PlayerMovement : MonoBehaviour {
 			Physics2D.OverlapBox(body.position + otherCenter, wallCollider.size, 0, ~(1 << 8) /*player*/) == null) {
 			isWall = false;
 		}
-
-		var bashTar = Physics2D.OverlapCapsule(body.position + bashCollider.offset, bashCollider.size, bashCollider.direction, 0, ~(1 << 8) /*player*/);
-		pbash.bashTarget = (bashTar && bashTar.tag == "Projectile") ? bashTar.transform : null;
 	}
 
 	void OnCollisionStay2D(Collision2D col) {
@@ -262,8 +258,8 @@ public class PlayerMovement : MonoBehaviour {
 			var horz = super.horz;
 
 			// SNAP DIRECTION
-			if (super.body.velocity.x * horz < 0) {
-				if (preventDir * super.body.velocity.x <= 0) { // run if not same sign
+			if (vel.x * horz < 0) {
+				if (preventDir * vel.x <= 0) { // run if not same sign
 					vel.x = 0;
 				}
 			}
@@ -288,12 +284,30 @@ public class PlayerMovement : MonoBehaviour {
 			return Quaternion.Euler(0, 0, super.groundNormal) * vel; // rotate to world
 		}
 
+		public void Reset() {
+			vel.x = 0;
+			preventDir = 0;
+		}
+
+		public void SetX(float x) {
+			vel.x = x;
+		}
+
+		public void ZeroDirection(bool right) {
+			if ((right && vel.x > 0) || (!right && vel.x < 0)) {
+				vel.x = 0;
+			}
+		}
+
 	}
 
 	[System.Serializable]
-	public class PlayerStandardDash : IPlayerSubmovement {
+	public class PlayerDash : IPlayerSubmovement {
+		public Vector2 realVel;
+
 		public bool dashing;
 		public bool canDash = true;
+		public bool dashRight;
 		public float dashSpeed = 20f;
 		public float dashTimeMax = 1f;
 		private float dashTime;
@@ -312,22 +326,36 @@ public class PlayerMovement : MonoBehaviour {
 				dashing = true;
 				canDash = false;
 				dashPostFix = false;
+
+				if (super.isWall) { // FIX
+					dashRight = super.wallNormal < 0;
+				} else {
+					dashRight = super.lookingRight;
+				}
 			}
 
 			// DASH
 			if (dashing) {
-				super.overrideVel = new Vector2(dashSpeed * (super.lookingRight ? 1 : -1), 0);
 
-				if (dashTime > 0 && !super.isWall) {
+				realVel = new Vector2(dashSpeed * (dashRight ? 1 : -1), 0);
+				super.overrideVel = realVel;
+
+				if (dashTime > 0.03f && super.isWall) {
+					dashing = false;
+				}
+
+				if (dashTime > 0) {
 					dashTime -= Time.fixedDeltaTime;
 				} else {
 					dashing = false;
 				}
 			}
 
+			// RESET ONCE
 			if (!dashPostFix && !dashing) {
 				dashPostFix = true;
 				super.overrideVel.x = 0;
+				//super.pmove.ZeroDirection(!dashRight);
 			}
 
 			return Vector2.zero;
@@ -365,8 +393,6 @@ public class PlayerMovement : MonoBehaviour {
 			}
 
 			if (jumping) {
-				super.isGrounded = false;
-
 				if (jumpTime > 0 && InputWrapper.GetJump()) {
 					super.overrideVel.y = jumpSpeedCur.y;
 
@@ -392,14 +418,10 @@ public class PlayerMovement : MonoBehaviour {
 	}
 
 	[System.Serializable]
-	public class PlayerWall : IPlayerSubmovement {
+	public class PlayerWallClimb : IPlayerSubmovement {
 		public Vector2 vel;
 
 		public float wallSpeed = 5f;
-		public float wallJumpSpeed = 6f;
-		public float wallJumpAngle = 30f;
-		public float wallJumpTime = 0.07f;
-		public float wallJumpMoveSuppress = 0.03f;
 
 		PlayerMovement super;
 
@@ -409,43 +431,59 @@ public class PlayerMovement : MonoBehaviour {
 
 		public Vector2 Update() {
 
-			//if (InputWrapper.GetJumpDown()) {
-			//	var jumpV = new Vector2(0, wallJumpSpeed);
-			//	jumpV = Quaternion.Euler(0, 0, wallJumpAngle * (super.wallNormal < 0 ? -1 : 1)) * jumpV;
-			//	vel = jumpV;
-			//	super.pjump.SetJumpSpeedCur(jumpV);
-
-			//	super.isWall = false;
-			//	super.pjump.jumping = true;
-			//	super.partsys.Play();
-
-			//	super.pjump.jumpTime = wallJumpTime;
-			//	super.pjump.jumpCount = 1;
-
-			//	//preventDir = wallNormal < 0 ? -1 : 1;
-			//}
-
-			if (InputWrapper.GetWallGrab()) {
-				super.body.velocity = Vector2.zero;
-
-				super.applyGravity = false;
-				super.trail.enabled = false;
-
+			if (InputWrapper.GetWallGrab() && super.wallNormal != 0) {
 				if (super.vert != 0) {
-					var wallV = new Vector2(super.vert * wallSpeed, 0);
+					var wallV = new Vector2(super.vert * wallSpeed * Mathf.Sign(super.wallNormal), 0);
 					vel = Quaternion.Euler(0, 0, super.wallNormal) * wallV; // rotate to world
-					if (vel.x == 0) {
-						vel.x = Mathf.Infinity;
-					}
 				} else {
+					super.overrideVel = Vector2.zero;
+					super.applyGravity = false;
 					vel = Vector2.zero;
 				}
-
+			} else {
+				vel = Vector2.zero;
 			}
 
 			return vel;
 		}
 
+
+	}
+
+	[System.Serializable]
+	public class PlayerWallJump : IPlayerSubmovement {
+		public Vector2 vel;
+
+		public float wallJumpSpeed = 6f;
+		public float wallJumpAngle = 30f;
+		public float wallJumpTime = 0.07f;
+
+		PlayerMovement super;
+
+		public void Init(PlayerMovement player) {
+			super = player;
+		}
+
+		public Vector2 Update() {
+			if (InputWrapper.GetJumpDown()) {
+				var jumpV = Quaternion.Euler(0, 0, wallJumpAngle * Mathf.Sign(super.wallNormal)) * new Vector2(0, wallJumpSpeed);
+				vel = jumpV;
+
+				super.pmove.Reset();
+
+				super.partsys.Play();
+
+				super.pjump.SetJumpSpeedCur(jumpV);
+				super.pjump.jumping = true;
+				super.pjump.jumpTime = wallJumpTime;
+				super.pjump.jumpCount = 1;
+
+				//preventDir = wallNormal < 0 ? -1 : 1;
+			} else {
+				vel = Vector2.zero;
+			}
+			return vel;
+		}
 	}
 
 	[System.Serializable]
@@ -455,14 +493,20 @@ public class PlayerMovement : MonoBehaviour {
 		public Transform bashTarget, bashArrow;
 		public float bashAngle;
 		private bool bashInit;
+
 		private float bashTimeStarted;
 		public float bashTimeMax = 2f;
 		public float bashTimeSetupMax = 0.3f;
 		public float bashSetupRate = 8000f;
+
 		public float bashSpeed = 8f;
+		public float bashSpeedFalloffMult = 0.8f;
 		public float bashKnockback = 8f;
+
 		public float bashCooldownMax = 0.3f;
 		private float bashCooldown;
+
+		public CapsuleCollider2D bashCollider;
 
 		PlayerMovement super;
 
@@ -471,41 +515,12 @@ public class PlayerMovement : MonoBehaviour {
 		}
 
 		public Vector2 Update() {
-			UpdateBash();
-			return vel;
-		}
-
-		public void UpdateBashCommon() {
-			if (bashCooldown > 0) {
-				bashCooldown -= Time.fixedDeltaTime;
+			if (!bashTarget || super.mode != MoveMode.BASH) {
+				return Vector2.zero;
 			}
 
-			if (bashTarget) {
-				bashArrow.position = bashTarget.position;
-				bashArrow.localRotation = Quaternion.Euler(0, 0, bashAngle);
-
-				if (InputWrapper.GetBash() && !bashInit && bashCooldown <= 0) {
-					bashInit = true;
-					super.mode = MoveMode.BASH;
-					bashTimeStarted = Time.unscaledTime;
-				}
-			}
-
-			var isBash = super.mode == MoveMode.BASH;
-
-			if (!isBash) {
-				bashInit = false;
-			}
-
-			bashArrow.gameObject.SetActive(isBash);
-
-			Time.timeScale = isBash ? 0.01f : 1;
-			Time.fixedDeltaTime = Time.timeScale * super.initFixedDeltaTimescale;
-		}
-
-		void UpdateBash() {
+			// SET DIRECTION
 			var input = new Vector2(super.horz, super.vert);
-
 			if (input.sqrMagnitude != 0) {
 				var mouseAng = Vector2.SignedAngle(Vector2.up, input);
 
@@ -517,15 +532,21 @@ public class PlayerMovement : MonoBehaviour {
 				}
 			}
 
+			// PERFORM BASH
 			if (!InputWrapper.GetBash() || Time.unscaledTime - bashTimeStarted > bashTimeMax) {
 				DoBash();
 				super.mode = MoveMode.STANDARD;
+			} else {
+				vel = Vector2.zero;
 			}
+
+			return vel;
 		}
 
 		void DoBash() {
 			var bashQuat = Quaternion.Euler(0, 0, bashAngle);
-			super.body.velocity = bashQuat * new Vector2(0, bashSpeed);
+			vel = bashQuat * new Vector2(0, bashSpeed);
+
 			bashCooldown = bashCooldownMax;
 
 			var tarBody = bashTarget.GetComponent<Rigidbody2D>();
@@ -533,6 +554,48 @@ public class PlayerMovement : MonoBehaviour {
 				var oppDir = bashQuat * new Vector2(0, -bashKnockback);
 				tarBody.velocity = oppDir;
 			}
+		}
+
+		public void UpdateBashCommon() {
+			// RAMP VELOCITY TO ZERO
+			//if (vel.sqrMagnitude > 0.5f) {
+			//	vel *= bashSpeedFalloffMult;
+			//} else {
+			//	vel = Vector2.zero;
+			//}
+
+			// FIND TARGET
+			var bashTar = Physics2D.OverlapCapsule(super.body.position + bashCollider.offset, bashCollider.size, bashCollider.direction, 0, ~(1 << 8) /*player*/);
+			bashTarget = (bashTar && bashTar.tag == "Projectile") ? bashTar.transform : null;
+
+			// COOLDOWN
+			if (bashCooldown > 0) {
+				bashCooldown -= Time.fixedDeltaTime;
+			}
+
+			if (bashTarget) {
+				// MOVE ARROW
+				bashArrow.position = bashTarget.position;
+				bashArrow.localRotation = Quaternion.Euler(0, 0, bashAngle);
+
+				// START BASH
+				if (InputWrapper.GetBash() && !bashInit && bashCooldown <= 0) {
+					bashInit = true;
+					super.mode = MoveMode.BASH;
+					bashTimeStarted = Time.unscaledTime;
+				}
+			}
+
+			var isBash = super.mode == MoveMode.BASH;
+			if (!isBash) {
+				bashInit = false;
+			}
+
+			bashArrow.gameObject.SetActive(isBash);
+
+			// SET BULLET TIME
+			Time.timeScale = isBash ? 0.01f : 1;
+			Time.fixedDeltaTime = Time.timeScale * super.initFixedDeltaTimescale;
 		}
 	}
 
